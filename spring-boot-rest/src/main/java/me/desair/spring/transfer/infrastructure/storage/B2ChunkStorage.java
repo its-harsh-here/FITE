@@ -10,11 +10,14 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.*;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.io.InputStream;
 import java.net.URI;
 import java.util.List;
 import java.util.stream.Collectors;
+
+
 
 @Service
 @ConditionalOnProperty(name = "storage.type", havingValue = "b2")
@@ -23,6 +26,7 @@ public class B2ChunkStorage implements ChunkStorage {
     private final S3Client s3Client;
     private final String bucketName;
 
+    @Autowired
     public B2ChunkStorage(
             @Value("${b2.bucket}") String bucketName,
             @Value("${b2.endpoint}") String endpoint,
