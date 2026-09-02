@@ -1,5 +1,9 @@
 import type { TransferMetadata } from './types';
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
+
+const apiUrl = (path: string) => `${API_BASE_URL}${path}`;
+
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -31,7 +35,7 @@ export interface CreateTransferRequest {
 }
 
 export async function createTransfer(request: CreateTransferRequest): Promise<TransferMetadata> {
-  const response = await fetch('/api/transfers', {
+  const response = await fetch(apiUrl('/api/transfers'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request)
@@ -48,7 +52,7 @@ export async function uploadChunk(
   chunk: Blob, 
   checksum: string
 ): Promise<void> {
-  const response = await fetch(`/api/transfers/${transferId}/chunks/${chunkIndex}`, {
+  const response = await fetch(apiUrl(`/api/transfers/${transferId}/chunks/${chunkIndex}`), {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/octet-stream',
@@ -64,7 +68,7 @@ export async function uploadChunk(
 }
 
 export async function completeTransfer(transferId: string): Promise<void> {
-  const response = await fetch(`/api/transfers/${transferId}/complete`, { method: 'POST' });
+  const response = await fetch(apiUrl(`/api/transfers/${transferId}/complete`), { method: 'POST' });
   if (!response.ok) {
     await handleResponseError(response, 'Failed to complete transfer');
   }
@@ -73,7 +77,7 @@ export async function completeTransfer(transferId: string): Promise<void> {
 export async function getTransferDetails(transferId: string, token?: string): Promise<TransferMetadata> {
   const cleanToken = token?.trim();
   const url = cleanToken ? `/api/transfers/${transferId}?token=${encodeURIComponent(cleanToken)}` : `/api/transfers/${transferId}`;
-  const response = await fetch(url);
+  const response = await fetch(apiUrl(url));
   if (!response.ok) {
     await handleResponseError(response, 'Failed to get transfer details');
   }
@@ -82,7 +86,7 @@ export async function getTransferDetails(transferId: string, token?: string): Pr
 
 export async function getTransferByCode(transferCode: string): Promise<TransferMetadata> {
   const cleanCode = encodeURIComponent(transferCode.trim().toUpperCase());
-  const response = await fetch(`/api/transfers/code/${cleanCode}`);
+  const response = await fetch(apiUrl(`/api/transfers/code/${cleanCode}`));
   if (!response.ok) {
     await handleResponseError(response, 'Transfer not found');
   }
@@ -92,7 +96,7 @@ export async function getTransferByCode(transferCode: string): Promise<TransferM
 export async function getAvailableChunks(transferId: string, token?: string): Promise<number[]> {
   const cleanToken = token?.trim();
   const url = cleanToken ? `/api/transfers/${transferId}/chunks?token=${encodeURIComponent(cleanToken)}` : `/api/transfers/${transferId}/chunks`;
-  const response = await fetch(url);
+  const response = await fetch(apiUrl(url));
   if (!response.ok) {
     await handleResponseError(response, 'Failed to get chunk availability');
   }
@@ -102,7 +106,7 @@ export async function getAvailableChunks(transferId: string, token?: string): Pr
 export async function downloadChunk(transferId: string, chunkIndex: number, token?: string): Promise<{blob: Blob, checksum: string | null}> {
   const cleanToken = token?.trim();
   const url = cleanToken ? `/api/transfers/${transferId}/chunks/${chunkIndex}?token=${encodeURIComponent(cleanToken)}` : `/api/transfers/${transferId}/chunks/${chunkIndex}`;
-  const response = await fetch(url);
+  const response = await fetch(apiUrl(url));
   if (!response.ok) {
     await handleResponseError(response, `Failed to download chunk ${chunkIndex}`);
   }
