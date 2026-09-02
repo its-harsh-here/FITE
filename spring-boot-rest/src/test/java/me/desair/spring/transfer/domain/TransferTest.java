@@ -24,8 +24,8 @@ class TransferTest {
         
         assertTrue(transfer.isExpired(now));
         
-        assertThrows(TransferDomainException.class, () -> transfer.checkAccess("token", now));
-        assertThrows(TransferDomainException.class, () -> transfer.checkUploadAllowed(now));
+        assertThrows(TransferExpiredException.class, () -> transfer.checkAccess("token", now));
+        assertThrows(TransferExpiredException.class, () -> transfer.checkUploadAllowed(now));
     }
 
     @Test

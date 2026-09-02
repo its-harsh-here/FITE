@@ -14,6 +14,21 @@ jobs:
       run:
         working-directory: spring-boot-rest
 
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: transfer_db
+          POSTGRES_USER: transfer_user
+          POSTGRES_PASSWORD: transfer_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
     - uses: actions/checkout@v4
     
@@ -25,6 +40,10 @@ jobs:
         cache: maven
         
     - name: Build and run tests
+      env:
+        SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/transfer_db
+        SPRING_DATASOURCE_USERNAME: transfer_user
+        SPRING_DATASOURCE_PASSWORD: transfer_password
       run: mvn -B verify
 
   frontend-build-and-test:

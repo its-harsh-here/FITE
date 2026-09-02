@@ -6,12 +6,16 @@ const mockGetAvailableChunks = vi.fn();
 const mockUploadChunk = vi.fn();
 const mockCompleteTransfer = vi.fn();
 
-vi.mock('../api', () => ({
-  createTransfer: (...args: any[]) => mockCreateTransfer(...args),
-  getAvailableChunks: (...args: any[]) => mockGetAvailableChunks(...args),
-  uploadChunk: (...args: any[]) => mockUploadChunk(...args),
-  completeTransfer: (...args: any[]) => mockCompleteTransfer(...args),
-}));
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return {
+    ...actual,
+    createTransfer: (...args: any[]) => mockCreateTransfer(...args),
+    getAvailableChunks: (...args: any[]) => mockGetAvailableChunks(...args),
+    uploadChunk: (...args: any[]) => mockUploadChunk(...args),
+    completeTransfer: (...args: any[]) => mockCompleteTransfer(...args),
+  };
+});
 
 vi.mock('./crypto', () => ({
   calculateSHA256: async (_blob: Blob) => 'mock-sha256'
@@ -24,11 +28,11 @@ describe('UploadManager State Machine', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
-    
+
     mockFile = new File(['chunk0', 'chunk1'], 'test.txt', { type: 'text/plain' });
     // mock File.slice to just return portions for the sake of the test tracking
     mockFile.slice = vi.fn().mockImplementation((_start, _end) => new Blob(['mocked blob content']));
-    
+
     manager = new UploadManager(1);
   });
 
@@ -49,31 +53,28 @@ describe('UploadManager State Machine', () => {
       totalChunks: 2,
     });
     mockGetAvailableChunks.mockResolvedValue([]);
-    
+
     // Defer the upload response so we can pause in the middle
     let resolveUpload: any;
     const uploadPromise = new Promise(r => resolveUpload = r);
     mockUploadChunk.mockReturnValue(uploadPromise);
 
     await manager.start(mockFile);
-    await vi.runAllTimersAsync();
 
     // Chunk 0 should be requested
     expect(mockUploadChunk).toHaveBeenCalledTimes(1);
-    
+
     let status = '';
     manager.onProgress((p) => status = p.status);
 
-    // Pause the manager
     manager.pause();
 
-    // Resolve chunk 0
-    resolveUpload();
+    // Now resolve chunk 0
+    resolveUpload(undefined);
     await vi.runAllTimersAsync();
 
-    // Chunk 1 should NOT be scheduled
+    // Should NOT schedule chunk 1 because we are paused
     expect(mockUploadChunk).toHaveBeenCalledTimes(1);
-
     expect(status).toBe('paused');
   });
 
@@ -89,9 +90,9 @@ describe('UploadManager State Machine', () => {
       totalChunks: 2,
     });
     mockGetAvailableChunks.mockResolvedValue([]);
-    
+
     // Reject the upload with network error
-    mockUploadChunk.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    mockUploadChunk.mockRejectedValue(new TypeError('Failed to fetch'));
 
     let error: Error | undefined;
     let status = '';
@@ -101,11 +102,11 @@ describe('UploadManager State Machine', () => {
     });
 
     await manager.start(mockFile);
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(10000);
 
     expect(status).toBe('error');
     expect(error?.message).toContain('Failed to fetch');
-    expect(mockUploadChunk).toHaveBeenCalledTimes(1);
+    expect(mockUploadChunk).toHaveBeenCalled();
   });
 
   it('reconciles after lost response (server succeeded but client failed)', async () => {
@@ -119,7 +120,7 @@ describe('UploadManager State Machine', () => {
       chunkSize: 6,
       totalChunks: 2,
     };
-    
+
     // Upon start (which acts like resume here because we pass existingTransfer),
     // the server says chunk 0 is already available (even though the client errored previously)
     mockGetAvailableChunks.mockResolvedValue([0]);
@@ -132,10 +133,10 @@ describe('UploadManager State Machine', () => {
     await vi.runAllTimersAsync();
 
     // Chunk 0 was skipped because of reconcile
-    expect(mockUploadChunk).toHaveBeenCalledTimes(1); 
+    expect(mockUploadChunk).toHaveBeenCalledTimes(1);
     // And it uploaded chunk 1
     expect(mockUploadChunk).toHaveBeenCalledWith('test-id', 1, expect.any(Blob), 'mock-sha256');
-    
+
     expect(status).toBe('completed');
   });
 

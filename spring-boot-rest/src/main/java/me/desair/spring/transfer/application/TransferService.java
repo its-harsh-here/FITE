@@ -1,5 +1,14 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.application;
 
+import me.desair.spring.transfer.application.exception.ChunkNotAvailableException;
+import me.desair.spring.transfer.application.exception.TransferNotFoundException;
+import me.desair.spring.transfer.domain.TransferExpiredException;
+import me.desair.spring.transfer.domain.TransferStatus;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkRepository;
+import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
+import me.desair.spring.transfer.infrastructure.storage.ChunkStorage;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import me.desair.spring.transfer.domain.Transfer;
@@ -36,7 +45,7 @@ public class TransferService {
 
     private Transfer toDomain(TransferEntity entity) {
         Transfer domain = new Transfer(
-            entity.getTransferId(), entity.getShareToken(), entity.getFileName(),
+            entity.getTransferId(), entity.getShareToken(), entity.getTransferCode(), entity.getFileName(),
             entity.getContentType(), entity.getFileSize(), entity.getChunkSize(),
             entity.getTotalChunks(), entity.getStatus(), entity.getCreatedAt(), entity.getExpiresAt()
         );
@@ -53,6 +62,7 @@ public class TransferService {
         TransferEntity entity = transferRepository.findById(domain.getId()).orElseGet(TransferEntity::new);
         entity.setTransferId(domain.getId());
         entity.setShareToken(domain.getShareToken());
+        entity.setTransferCode(domain.getTransferCode());
         entity.setFileName(domain.getFileName());
         entity.setContentType(domain.getContentType());
         entity.setFileSize(domain.getFileSize());
@@ -93,6 +103,19 @@ public class TransferService {
         return entity;
     }
 
+    public TransferEntity getTransferByCode(String transferCode) {
+        if (transferCode == null || transferCode.isBlank()) {
+            throw new TransferNotFoundException("Transfer not found");
+        }
+        TransferEntity entity = transferRepository.findByTransferCode(transferCode.trim().toUpperCase())
+            .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
+        Transfer domain = toDomain(entity);
+        if (domain.isExpired(Instant.now())) {
+            throw new TransferExpiredException("Transfer is expired");
+        }
+        return entity;
+    }
+
     public List<Integer> getAvailableChunks(String transferId, String token) {
         TransferEntity entity = transferRepository.findById(transferId)
             .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
@@ -101,10 +124,30 @@ public class TransferService {
         return domain.getAvailableChunkIndexes().stream().toList();
     }
 
+    public static String normalizeChecksum(String checksum) {
+        if (checksum == null) {
+            return null;
+        }
+        String normalized = checksum.trim();
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        String lower = normalized.toLowerCase();
+        if (lower.startsWith("sha256:")) {
+            normalized = normalized.substring(7).trim();
+        } else if (lower.startsWith("sha-256:")) {
+            normalized = normalized.substring(9).trim();
+        }
+        if (!normalized.matches("^[a-fA-F0-9]{64}$")) {
+            throw new IllegalArgumentException("Invalid checksum format");
+        }
+        return normalized.toLowerCase();
+    }
+
     @Transactional
     public void uploadChunk(String transferId, int chunkIndex, String expectedChecksum, InputStream data, long size) throws Exception {
         TransferEntity entity = transferRepository.findById(transferId)
-            .orElseThrow(() -> new IllegalArgumentException("Transfer not found"));
+            .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
             
         Transfer domain = toDomain(entity);
         
@@ -128,34 +171,65 @@ public class TransferService {
                 throw new IllegalArgumentException("Invalid chunk size. Expected " + expectedSize + " but got " + receivedSize);
             }
             
-            String calculatedChecksum = HexFormat.of().formatHex(digest.digest());
+            String calculatedChecksum = HexFormat.of().formatHex(digest.digest()).toLowerCase();
             
             // 5. Validate checksum (if client provided one)
-            if (expectedChecksum != null && !calculatedChecksum.equalsIgnoreCase(expectedChecksum)) {
+            String normalizedExpected = normalizeChecksum(expectedChecksum);
+            if (normalizedExpected != null && !calculatedChecksum.equalsIgnoreCase(normalizedExpected)) {
                 throw new IllegalArgumentException("Checksum mismatch");
             }
 
-            // Check Idempotency based on calculated checksum vs existing
-            if (domain.getAvailableChunkIndexes().contains(chunkIndex)) {
-                TransferChunk existing = domain.getChunk(chunkIndex);
-                if (!existing.getChecksum().equalsIgnoreCase(calculatedChecksum)) {
+            // Pre-check Idempotency if already in DB
+            Optional<TransferChunkEntity> existingChunk = chunkRepository.findByTransferIdAndChunkIndex(transferId, chunkIndex);
+            if (existingChunk.isPresent()) {
+                if (!existingChunk.get().getChecksum().equalsIgnoreCase(calculatedChecksum)) {
                     throw new IllegalStateException("Chunk already exists with different content");
                 }
                 // Identical retry => deterministic idempotent success
                 return;
             }
 
-            // 6. Persist bytes
+            // 6. Persist bytes to storage provider using checksum-isolated key
             try (InputStream is = new FileInputStream(tempFile.toFile())) {
-                chunkStorage.putChunk(transferId, chunkIndex, is, receivedSize);
+                chunkStorage.putChunk(transferId, chunkIndex, calculatedChecksum, is, receivedSize);
             }
 
-            // 7. & 8. Mark AVAILABLE and Persist metadata transactionally
-            TransferChunk newChunk = new TransferChunk(chunkIndex, receivedSize, calculatedChecksum, Instant.now());
-            domain.markChunkAvailable(newChunk, Instant.now());
-            
-            // DB uniqueness constraint handles concurrent identical/conflicting writes
-            saveDomain(domain);
+            // 7. & 8. Mark AVAILABLE and Persist metadata transactionally using DB constraint as concurrency backstop
+            TransferChunkEntity chunkEntity = new TransferChunkEntity();
+            chunkEntity.setTransferId(transferId);
+            chunkEntity.setChunkIndex(chunkIndex);
+            chunkEntity.setSize(receivedSize);
+            chunkEntity.setChecksum(calculatedChecksum);
+            chunkEntity.setStorageKey("transfers/" + transferId + "/chunks/" + String.format("%06d_%s", chunkIndex, calculatedChecksum));
+            chunkEntity.setUploadedAt(Instant.now());
+
+            try {
+                chunkRepository.saveAndFlush(chunkEntity);
+            } catch (org.springframework.dao.DataIntegrityViolationException ex) {
+                // Concurrent insert occurred — resolve conflict authoritatively through the DB unique constraint
+                Optional<TransferChunkEntity> winningChunk = chunkRepository.findByTransferIdAndChunkIndex(transferId, chunkIndex);
+                if (winningChunk.isPresent() && winningChunk.get().getChecksum().equalsIgnoreCase(calculatedChecksum)) {
+                    // Same verified checksum -> deterministic idempotent success (winner owns the matching object)
+                    return;
+                } else {
+                    // Different checksum -> CHUNK_CONFLICT: delete only THIS losing request's staged object
+                    try {
+                        chunkStorage.deleteChunk(transferId, chunkIndex, calculatedChecksum);
+                    } catch (Exception ignored) {}
+                    throw new IllegalStateException("Chunk already exists with different content");
+                }
+            } catch (Exception ex) {
+                // Storage succeeded but metadata save failed — perform best-effort cleanup of orphan storage object
+                try {
+                    chunkStorage.deleteChunk(transferId, chunkIndex, calculatedChecksum);
+                } catch (Exception ignored) {}
+                throw ex;
+            }
+
+            if (entity.getStatus() == TransferStatus.CREATED) {
+                entity.setStatus(TransferStatus.UPLOADING);
+                transferRepository.save(entity);
+            }
 
         } finally {
             Files.deleteIfExists(tempFile);
@@ -177,14 +251,14 @@ public class TransferService {
     }
 
     public InputStream getChunkStream(String transferId, int chunkIndex, String token) throws Exception {
-        getChunkInfo(transferId, chunkIndex, token); // Validates existence and access
-        return chunkStorage.getChunk(transferId, chunkIndex);
+        TransferChunkEntity chunkInfo = getChunkInfo(transferId, chunkIndex, token); // Validates existence and access
+        return chunkStorage.getChunk(transferId, chunkIndex, chunkInfo.getChecksum());
     }
 
     @Transactional
     public void completeTransfer(String transferId) {
         TransferEntity entity = transferRepository.findById(transferId)
-            .orElseThrow(() -> new IllegalArgumentException("Transfer not found"));
+            .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
             
         Transfer domain = toDomain(entity);
         domain.complete(Instant.now());

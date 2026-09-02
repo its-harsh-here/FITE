@@ -22,7 +22,7 @@ function App() {
   let page;
   if (route.startsWith('/send')) {
     page = <SendPage onHome={() => navigate('/')} />;
-  } else if (route.startsWith('/receive') || route.startsWith('/download/')) {
+  } else if (route.startsWith('/receive') || route.startsWith('/download/') || route.startsWith('/transfer/')) {
     page = <ReceivePage onHome={() => navigate('/')} />;
   } else {
     page = <LandingPage navigate={navigate} />;

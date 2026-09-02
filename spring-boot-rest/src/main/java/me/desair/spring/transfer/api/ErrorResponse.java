@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.api;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;

@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.infrastructure.storage;
 
 public class StorageFileNotFoundException extends StorageException {
     public StorageFileNotFoundException(String message) {

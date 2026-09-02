@@ -1,6 +1,9 @@
 package me.desair.spring.transfer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import me.desair.spring.transfer.api.CreateTransferRequest;
+import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -16,7 +19,11 @@ import java.util.HexFormat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-@SpringBootTest
+@SpringBootTest(properties = {
+    "transfer.chunk-size-bytes=1024",
+    "storage.type=local",
+    "storage.local.directory=target/test-completion-storage"
+})
 @AutoConfigureMockMvc
 public class CompletionSemanticsIntegrationTest {
 
@@ -43,7 +50,20 @@ public class CompletionSemanticsIntegrationTest {
 
         mockMvc.perform(get("/api/transfers/" + tId + "?token=" + token))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("COMPLETED"));
+                .andExpect(jsonPath("$.status").value("COMPLETE"));
+    }
+
+    @Test
+    void testIncompleteTransferCannotBeCompleted() throws Exception {
+        TransferEntity transfer = createTransfer(2); // 2 chunks expected
+        String tId = transfer.getTransferId();
+
+        // Upload only 1 chunk out of 2
+        uploadChunk(tId, 0);
+
+        // Attempting to complete must fail
+        mockMvc.perform(post("/api/transfers/" + tId + "/complete"))
+                .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -85,12 +105,12 @@ public class CompletionSemanticsIntegrationTest {
         // 1. Attempting to get details -> 410 Gone
         mockMvc.perform(get("/api/transfers/" + tId + "?token=" + token))
                 .andExpect(status().isGone())
-                .andExpect(jsonPath("$.error").value("TRANSFER_EXPIRED"));
+                .andExpect(jsonPath("$.code").value("TRANSFER_EXPIRED"));
 
         // 2. Attempting to get chunks -> 410 Gone
         mockMvc.perform(get("/api/transfers/" + tId + "/chunks?token=" + token))
                 .andExpect(status().isGone())
-                .andExpect(jsonPath("$.error").value("TRANSFER_EXPIRED"));
+                .andExpect(jsonPath("$.code").value("TRANSFER_EXPIRED"));
                 
         // 3. Attempting to upload -> 410 Gone
         byte[] data = new byte[1024];
@@ -105,7 +125,6 @@ public class CompletionSemanticsIntegrationTest {
         req.setFileName("test.txt");
         req.setFileSize((long) chunks * 1024);
         req.setContentType("text/plain");
-        req.setChunkSize(1024L);
 
         String json = mockMvc.perform(post("/api/transfers")
                 .contentType(MediaType.APPLICATION_JSON)

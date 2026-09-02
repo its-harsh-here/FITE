@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.api;
 
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;

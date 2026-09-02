@@ -1,6 +1,12 @@
 package me.desair.spring.transfer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import me.desair.spring.transfer.api.CreateTransferRequest;
+import me.desair.spring.transfer.application.TransferCleanupService;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkRepository;
+import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
+import me.desair.spring.transfer.infrastructure.storage.ChunkStorage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -10,7 +16,6 @@ import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
-import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -18,12 +23,12 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @SpringBootTest(properties = {
+    "transfer.chunk-size-bytes=1024",
     "storage.type=local",
     "storage.local.directory=target/test-cleanup-storage"
 })
@@ -59,7 +64,6 @@ public class TransferCleanupIntegrationTest {
         req.setFileName("test.txt");
         req.setFileSize(2048L);
         req.setContentType("text/plain");
-        req.setChunkSize(1024L);
 
         String json = mockMvc.perform(post("/api/transfers")
                 .contentType(MediaType.APPLICATION_JSON)

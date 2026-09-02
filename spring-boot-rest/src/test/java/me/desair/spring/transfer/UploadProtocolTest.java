@@ -1,9 +1,15 @@
 package me.desair.spring.transfer;
 
+import me.desair.spring.transfer.application.TransferService;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkRepository;
+import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
+import me.desair.spring.transfer.infrastructure.storage.ChunkStorage;
+import me.desair.spring.transfer.infrastructure.storage.StorageException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import java.io.ByteArrayInputStream;
@@ -40,7 +46,7 @@ public class UploadProtocolTest {
 
     @BeforeEach
     void setUp() {
-        service = new TransferService(transferRepository, chunkRepository, chunkStorage);
+        service = new TransferService(transferRepository, chunkRepository, chunkStorage, 8388608L);
         dummyTransfer = new TransferEntity();
         dummyTransfer.setTransferId("tf_1");
         dummyTransfer.setShareToken("st_1");
@@ -71,8 +77,8 @@ public class UploadProtocolTest {
         
         service.uploadChunk("tf_1", 0, null, new ByteArrayInputStream(data), 100);
         
-        verify(chunkStorage).putChunk(eq("tf_1"), eq(0), any(InputStream.class), eq(100L));
-        verify(chunkRepository).save(any(TransferChunkEntity.class));
+        verify(chunkStorage).putChunk(eq("tf_1"), eq(0), anyString(), any(InputStream.class), eq(100L));
+        verify(chunkRepository).saveAndFlush(any(TransferChunkEntity.class));
     }
 
     @Test
@@ -102,13 +108,15 @@ public class UploadProtocolTest {
     void testChecksumMismatch() throws Exception {
         when(transferRepository.findById("tf_1")).thenReturn(Optional.of(dummyTransfer));
         byte[] data = createData(100, (byte) 1);
+        String wrongHash = "0000000000000000000000000000000000000000000000000000000000000000";
         
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> 
-            service.uploadChunk("tf_1", 0, "wrong_checksum", new ByteArrayInputStream(data), 100));
+            service.uploadChunk("tf_1", 0, wrongHash, new ByteArrayInputStream(data), 100));
         assertTrue(e.getMessage().contains("Checksum mismatch"));
         
         verifyNoInteractions(chunkStorage);
         verify(chunkRepository, never()).save(any());
+        verify(chunkRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -123,6 +131,7 @@ public class UploadProtocolTest {
         
         when(transferRepository.findById("tf_1")).thenReturn(Optional.of(dummyTransfer));
         when(chunkRepository.findByTransferIdOrderByChunkIndexAsc("tf_1")).thenReturn(java.util.List.of(existing));
+        when(chunkRepository.findByTransferIdAndChunkIndex("tf_1", 0)).thenReturn(Optional.of(existing));
         
         // Upload again with exactly the same bytes
         service.uploadChunk("tf_1", 0, null, new ByteArrayInputStream(data), 100);
@@ -130,6 +139,7 @@ public class UploadProtocolTest {
         // Should not hit storage or DB save because it's completely identical
         verifyNoInteractions(chunkStorage);
         verify(chunkRepository, never()).save(any());
+        verify(chunkRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -144,6 +154,7 @@ public class UploadProtocolTest {
         
         when(transferRepository.findById("tf_1")).thenReturn(Optional.of(dummyTransfer));
         when(chunkRepository.findByTransferIdOrderByChunkIndexAsc("tf_1")).thenReturn(java.util.List.of(existing));
+        when(chunkRepository.findByTransferIdAndChunkIndex("tf_1", 0)).thenReturn(Optional.of(existing));
         
         // Upload with different bytes (2s)
         byte[] data2 = createData(100, (byte) 2);
@@ -153,6 +164,7 @@ public class UploadProtocolTest {
         assertTrue(e.getMessage().contains("Chunk already exists with different content"));
         
         verifyNoInteractions(chunkStorage);
+        verify(chunkRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -160,12 +172,13 @@ public class UploadProtocolTest {
         when(transferRepository.findById("tf_1")).thenReturn(Optional.of(dummyTransfer));
         byte[] data = createData(100, (byte) 1);
         
-        doThrow(new StorageException("Disk full")).when(chunkStorage).putChunk(anyString(), anyInt(), any(), anyLong());
+        doThrow(new StorageException("Disk full")).when(chunkStorage).putChunk(anyString(), anyInt(), anyString(), any(InputStream.class), anyLong());
         
         assertThrows(StorageException.class, () -> 
             service.uploadChunk("tf_1", 0, null, new ByteArrayInputStream(data), 100));
             
         verify(chunkRepository, never()).save(any());
+        verify(chunkRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -174,9 +187,31 @@ public class UploadProtocolTest {
         byte[] data = createData(100, (byte) 1);
         
         when(chunkRepository.findByTransferIdAndChunkIndex("tf_1", 0)).thenReturn(Optional.empty());
-        when(chunkRepository.save(any())).thenThrow(new DataIntegrityViolationException("Constraint violation"));
+        when(chunkRepository.saveAndFlush(any())).thenThrow(new RuntimeException("DB down"));
         
-        assertThrows(DataIntegrityViolationException.class, () -> 
+        assertThrows(RuntimeException.class, () -> 
             service.uploadChunk("tf_1", 0, null, new ByteArrayInputStream(data), 100));
+    }
+
+    @Test
+    void testConcurrentDuplicateInsertIdempotentResolution() throws Exception {
+        byte[] data = createData(100, (byte) 1);
+        String hash = calculateSha256(data);
+
+        TransferChunkEntity winningChunk = new TransferChunkEntity();
+        winningChunk.setChunkIndex(0);
+        winningChunk.setSize(100);
+        winningChunk.setChecksum(hash);
+
+        when(transferRepository.findById("tf_1")).thenReturn(Optional.of(dummyTransfer));
+        // First check returns empty (not in DB yet)
+        when(chunkRepository.findByTransferIdAndChunkIndex("tf_1", 0))
+            .thenReturn(Optional.empty())
+            .thenReturn(Optional.of(winningChunk)); // Second check after race returns winning chunk
+        // DB insert throws unique constraint violation because concurrent thread inserted first
+        when(chunkRepository.saveAndFlush(any())).thenThrow(new DataIntegrityViolationException("Unique constraint"));
+
+        // Should resolve idempotently without throwing
+        service.uploadChunk("tf_1", 0, null, new ByteArrayInputStream(data), 100);
     }
 }

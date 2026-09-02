@@ -45,8 +45,13 @@ class TransferCreationTest {
         assertTrue(t1.getShareToken().startsWith("st_"));
         assertEquals(67, t1.getShareToken().length()); // "st_" (3) + 32 bytes hex (64) = 67
 
+        assertNotNull(t1.getTransferCode());
+        assertEquals(6, t1.getTransferCode().length());
+        assertTrue(t1.getTransferCode().matches("^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$"));
+
         assertNotEquals(t1.getId(), t2.getId());
         assertNotEquals(t1.getShareToken(), t2.getShareToken());
+        assertNotEquals(t1.getTransferCode(), t2.getTransferCode());
 
         assertNotNull(t1.getExpiresAt());
         assertTrue(t1.getExpiresAt().isAfter(Instant.now()));

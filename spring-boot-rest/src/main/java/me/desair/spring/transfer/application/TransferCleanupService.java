@@ -1,5 +1,9 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.application;
 
+import me.desair.spring.transfer.infrastructure.storage.ChunkStorage;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkRepository;
+import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;

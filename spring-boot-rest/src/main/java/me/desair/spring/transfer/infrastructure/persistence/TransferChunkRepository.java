@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.infrastructure.persistence;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;

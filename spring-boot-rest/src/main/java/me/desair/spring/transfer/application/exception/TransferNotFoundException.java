@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.application.exception;
 
 public class TransferNotFoundException extends RuntimeException {
     public TransferNotFoundException(String message) {

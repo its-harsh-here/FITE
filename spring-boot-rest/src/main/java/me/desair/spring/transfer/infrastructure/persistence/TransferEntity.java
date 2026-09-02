@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.infrastructure.persistence;
 
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
@@ -17,6 +17,7 @@ public class TransferEntity {
     private String transferId;
 
     private String shareToken;
+    private String transferCode;
     private String fileName;
     private String contentType;
     private long fileSize;

@@ -11,6 +11,7 @@ import java.time.temporal.ChronoUnit;
 public class Transfer {
     private final String id;
     private final String shareToken;
+    private final String transferCode;
     private final String fileName;
     private final String contentType;
     private final long fileSize;
@@ -22,11 +23,12 @@ public class Transfer {
     private TransferStatus status;
     private final Map<Integer, TransferChunk> chunks = new HashMap<>();
 
-    public Transfer(String id, String shareToken, String fileName, String contentType, 
+    public Transfer(String id, String shareToken, String transferCode, String fileName, String contentType, 
                     long fileSize, long chunkSize, int totalChunks, 
                     TransferStatus status, Instant createdAt, Instant expiresAt) {
         this.id = id;
         this.shareToken = shareToken;
+        this.transferCode = transferCode;
         this.fileName = fileName;
         this.contentType = contentType;
         this.fileSize = fileSize;
@@ -35,6 +37,23 @@ public class Transfer {
         this.status = status;
         this.createdAt = createdAt;
         this.expiresAt = expiresAt;
+    }
+
+    public Transfer(String id, String shareToken, String fileName, String contentType, 
+                    long fileSize, long chunkSize, int totalChunks, 
+                    TransferStatus status, Instant createdAt, Instant expiresAt) {
+        this(id, shareToken, null, fileName, contentType, fileSize, chunkSize, totalChunks, status, createdAt, expiresAt);
+    }
+
+    private static final String CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"; // 32 unambiguous chars
+
+    public static String generateTransferCode(int length) {
+        java.security.SecureRandom random = new java.security.SecureRandom();
+        char[] chars = new char[length];
+        for (int i = 0; i < length; i++) {
+            chars[i] = CODE_ALPHABET.charAt(random.nextInt(CODE_ALPHABET.length()));
+        }
+        return new String(chars);
     }
 
     public static Transfer createNew(String fileName, long fileSize, String contentType, long chunkSize) {
@@ -47,12 +66,13 @@ public class Transfer {
 
         String id = "tf_" + generateSecureToken(16);
         String token = "st_" + generateSecureToken(32);
+        String code = generateTransferCode(6);
         
         int total = (int) Math.ceil((double) fileSize / chunkSize);
         Instant now = Instant.now();
         Instant expires = now.plus(7, ChronoUnit.DAYS);
 
-        return new Transfer(id, token, fileName, contentType, fileSize, chunkSize, total, TransferStatus.CREATED, now, expires);
+        return new Transfer(id, token, code, fileName, contentType, fileSize, chunkSize, total, TransferStatus.CREATED, now, expires);
     }
 
     private static String generateSecureToken(int numBytes) {
@@ -81,7 +101,7 @@ public class Transfer {
         if (isExpired(now)) {
             throw new TransferExpiredException("Transfer is expired");
         }
-        if (token != null && !this.shareToken.equals(token)) {
+        if (token == null || token.isBlank() || !this.shareToken.equals(token)) {
             throw new TransferDomainException("Invalid share token");
         }
     }
@@ -143,6 +163,7 @@ public class Transfer {
 
     public String getId() { return id; }
     public String getShareToken() { return shareToken; }
+    public String getTransferCode() { return transferCode; }
     public String getFileName() { return fileName; }
     public String getContentType() { return contentType; }
     public long getFileSize() { return fileSize; }

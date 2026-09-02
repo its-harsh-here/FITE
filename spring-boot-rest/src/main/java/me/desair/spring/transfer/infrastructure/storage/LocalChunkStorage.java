@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.infrastructure.storage;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -23,14 +23,18 @@ public class LocalChunkStorage implements ChunkStorage {
         Files.createDirectories(this.baseDir);
     }
 
-    private Path getChunkPath(String transferId, int chunkIndex) {
+    private Path getChunkPath(String transferId, int chunkIndex, String checksum) {
         if (transferId == null || transferId.isBlank() || transferId.contains("..") || transferId.contains("/") || transferId.contains("\\")) {
             throw new StorageException("Invalid transferId for storage operations");
         }
         if (chunkIndex < 0) {
             throw new StorageException("Chunk index cannot be negative");
         }
-        Path path = baseDir.resolve(transferId).resolve("chunks").resolve(String.format("%06d", chunkIndex)).normalize().toAbsolutePath();
+        String fileName = (checksum != null && !checksum.isBlank()) 
+            ? String.format("%06d_%s", chunkIndex, checksum.toLowerCase()) 
+            : String.format("%06d", chunkIndex);
+            
+        Path path = baseDir.resolve(transferId).resolve("chunks").resolve(fileName).normalize().toAbsolutePath();
         if (!path.startsWith(baseDir)) {
             throw new StorageException("Path traversal attempt detected");
         }
@@ -38,19 +42,29 @@ public class LocalChunkStorage implements ChunkStorage {
     }
 
     @Override
-    public void putChunk(String transferId, int chunkIndex, InputStream data, long size) throws Exception {
-        Path chunkPath = getChunkPath(transferId, chunkIndex);
+    public void putChunk(String transferId, int chunkIndex, String checksum, InputStream data, long size) throws Exception {
+        Path chunkPath = getChunkPath(transferId, chunkIndex, checksum);
+        Path chunksDir = chunkPath.getParent();
+        Files.createDirectories(chunksDir);
+        
+        Path tempPath = chunksDir.resolve(String.format(".tmp_%06d_%s_%s", chunkIndex, checksum, java.util.UUID.randomUUID()));
         try {
-            Files.createDirectories(chunkPath.getParent());
-            Files.copy(data, chunkPath, StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(data, tempPath, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(tempPath, chunkPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                // Fallback for filesystems that do not support ATOMIC_MOVE across boundaries
+                Files.move(tempPath, chunkPath, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException e) {
+            Files.deleteIfExists(tempPath);
             throw new StorageException("Failed to store chunk " + chunkIndex + " for transfer " + transferId, e);
         }
     }
 
     @Override
-    public InputStream getChunk(String transferId, int chunkIndex) throws Exception {
-        Path chunkPath = getChunkPath(transferId, chunkIndex);
+    public InputStream getChunk(String transferId, int chunkIndex, String checksum) throws Exception {
+        Path chunkPath = getChunkPath(transferId, chunkIndex, checksum);
         try {
             return Files.newInputStream(chunkPath);
         } catch (NoSuchFileException e) {
@@ -61,13 +75,13 @@ public class LocalChunkStorage implements ChunkStorage {
     }
 
     @Override
-    public boolean exists(String transferId, int chunkIndex) {
-        return Files.exists(getChunkPath(transferId, chunkIndex));
+    public boolean exists(String transferId, int chunkIndex, String checksum) {
+        return Files.exists(getChunkPath(transferId, chunkIndex, checksum));
     }
 
     @Override
-    public void deleteChunk(String transferId, int chunkIndex) throws Exception {
-        Path chunkPath = getChunkPath(transferId, chunkIndex);
+    public void deleteChunk(String transferId, int chunkIndex, String checksum) throws Exception {
+        Path chunkPath = getChunkPath(transferId, chunkIndex, checksum);
         try {
             Files.deleteIfExists(chunkPath);
         } catch (IOException e) {

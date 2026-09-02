@@ -1,4 +1,4 @@
-package me.desair.spring.transfer;
+package me.desair.spring.transfer.infrastructure.storage;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -36,12 +36,16 @@ public class R2ChunkStorage implements ChunkStorage {
                 .build();
     }
 
-    private String getObjectKey(String transferId, int chunkIndex) {
+    private String getObjectKey(String transferId, int chunkIndex, String checksum) {
         validateTransferId(transferId);
         if (chunkIndex < 0) {
             throw new StorageException("Chunk index cannot be negative");
         }
-        return "transfers/" + transferId + "/chunks/" + String.format("%06d", chunkIndex);
+        String chunkName = (checksum != null && !checksum.isBlank()) 
+            ? String.format("%06d_%s", chunkIndex, checksum.toLowerCase()) 
+            : String.format("%06d", chunkIndex);
+            
+        return "transfers/" + transferId + "/chunks/" + chunkName;
     }
 
     private String getTransferPrefix(String transferId) {
@@ -56,11 +60,11 @@ public class R2ChunkStorage implements ChunkStorage {
     }
 
     @Override
-    public void putChunk(String transferId, int chunkIndex, InputStream data, long size) throws StorageException {
+    public void putChunk(String transferId, int chunkIndex, String checksum, InputStream data, long size) throws StorageException {
         try {
             PutObjectRequest request = PutObjectRequest.builder()
                     .bucket(bucketName)
-                    .key(getObjectKey(transferId, chunkIndex))
+                    .key(getObjectKey(transferId, chunkIndex, checksum))
                     .contentLength(size)
                     .build();
             s3Client.putObject(request, RequestBody.fromInputStream(data, size));
@@ -70,11 +74,11 @@ public class R2ChunkStorage implements ChunkStorage {
     }
 
     @Override
-    public InputStream getChunk(String transferId, int chunkIndex) throws StorageFileNotFoundException, StorageException {
+    public InputStream getChunk(String transferId, int chunkIndex, String checksum) throws StorageFileNotFoundException, StorageException {
         try {
             GetObjectRequest request = GetObjectRequest.builder()
                     .bucket(bucketName)
-                    .key(getObjectKey(transferId, chunkIndex))
+                    .key(getObjectKey(transferId, chunkIndex, checksum))
                     .build();
             return s3Client.getObject(request);
         } catch (NoSuchKeyException e) {
@@ -85,11 +89,11 @@ public class R2ChunkStorage implements ChunkStorage {
     }
 
     @Override
-    public boolean exists(String transferId, int chunkIndex) {
+    public boolean exists(String transferId, int chunkIndex, String checksum) {
         try {
             HeadObjectRequest request = HeadObjectRequest.builder()
                     .bucket(bucketName)
-                    .key(getObjectKey(transferId, chunkIndex))
+                    .key(getObjectKey(transferId, chunkIndex, checksum))
                     .build();
             s3Client.headObject(request);
             return true;
@@ -102,11 +106,11 @@ public class R2ChunkStorage implements ChunkStorage {
     }
 
     @Override
-    public void deleteChunk(String transferId, int chunkIndex) throws StorageException {
+    public void deleteChunk(String transferId, int chunkIndex, String checksum) throws StorageException {
         try {
             DeleteObjectRequest request = DeleteObjectRequest.builder()
                     .bucket(bucketName)
-                    .key(getObjectKey(transferId, chunkIndex))
+                    .key(getObjectKey(transferId, chunkIndex, checksum))
                     .build();
             s3Client.deleteObject(request);
         } catch (Exception e) {

@@ -1,5 +1,9 @@
 package me.desair.spring.transfer;
 
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferChunkRepository;
+import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
+import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
@@ -91,5 +95,41 @@ public class TransferPersistenceIntegrationTest {
         transferRepository.flush();
 
         assertEquals(0, chunkRepository.findByTransferIdOrderByChunkIndexAsc("tf_456").size());
+    }
+
+    @Test
+    public void testTransferCodePersistenceAndUniqueConstraint() {
+        TransferEntity t1 = new TransferEntity();
+        t1.setTransferId("tf_code_1");
+        t1.setShareToken("st_code_1");
+        t1.setTransferCode("ABC7K9");
+        t1.setFileName("file1.txt");
+        t1.setFileSize(100);
+        t1.setChunkSize(10);
+        t1.setTotalChunks(10);
+        t1.setStatus(TransferStatus.CREATED);
+        t1.setCreatedAt(Instant.now());
+        t1.setExpiresAt(Instant.now().plusSeconds(3600));
+        transferRepository.saveAndFlush(t1);
+
+        assertTrue(transferRepository.findByTransferCode("ABC7K9").isPresent());
+        assertEquals("tf_code_1", transferRepository.findByTransferCode("ABC7K9").get().getTransferId());
+
+        // Duplicate transferCode must violate uniqueness constraint
+        TransferEntity t2 = new TransferEntity();
+        t2.setTransferId("tf_code_2");
+        t2.setShareToken("st_code_2");
+        t2.setTransferCode("ABC7K9"); // Duplicate code
+        t2.setFileName("file2.txt");
+        t2.setFileSize(100);
+        t2.setChunkSize(10);
+        t2.setTotalChunks(10);
+        t2.setStatus(TransferStatus.CREATED);
+        t2.setCreatedAt(Instant.now());
+        t2.setExpiresAt(Instant.now().plusSeconds(3600));
+
+        assertThrows(DataIntegrityViolationException.class, () -> {
+            transferRepository.saveAndFlush(t2);
+        });
     }
 }

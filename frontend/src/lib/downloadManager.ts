@@ -1,10 +1,14 @@
-import { getTransferDetails, getAvailableChunks, downloadChunk } from '../api';
+import { getTransferDetails, getAvailableChunks, downloadChunk, ApiError } from '../api';
 import { calculateSHA256 } from './crypto';
 import type { TransferMetadata, TransferStatus, TransferProgress } from '../types';
 
 // Simple IndexedDB wrapper for local state tracking
 const DB_NAME = 'TransferReceiverDB';
 const STORE_NAME = 'local_chunks';
+const MAX_CHUNK_RETRIES = 3;
+
+export const RECEIVER_ACTIVE_TRANSFER_KEY = 'receiver_active_transfer_id';
+export const RECEIVER_TRANSFER_PREFIX = 'receiver_transfer_';
 
 async function initDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -19,7 +23,7 @@ async function initDB(): Promise<IDBDatabase> {
   });
 }
 
-async function getLocalChunks(transferId: string): Promise<number[]> {
+export async function getLocalChunks(transferId: string): Promise<number[]> {
   try {
     const db = await initDB();
     return new Promise((resolve) => {
@@ -32,6 +36,19 @@ async function getLocalChunks(transferId: string): Promise<number[]> {
   } catch (e) {
     return []; // Fallback to memory
   }
+}
+
+export async function clearLocalChunks(transferId: string): Promise<void> {
+  try {
+    const db = await initDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.delete(transferId);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {}
 }
 
 async function saveLocalChunk(transferId: string, chunkIndex: number) {
@@ -60,13 +77,17 @@ export class DownloadManager {
   private transferDetails: TransferMetadata | null = null;
   private downloadedChunks = new Set<number>();
   private inProgressChunks = new Set<number>();
+  private chunkRetryCounts = new Map<number, number>();
+  private retryTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private availableChunks: number[] = [];
   private activeDownloads = 0;
   private maxConcurrency = 1; // Start sequentially as per rules
+  private currentOperationId = 0;
   private onProgressCb?: (progress: TransferProgress) => void;
   private error: Error | undefined;
   private fileHandle: any = null;
   private writable: any = null;
+  private writeLock: Promise<void> = Promise.resolve();
   private cancelSource: AbortController | null = null;
 
   constructor(transferId: string, maxConcurrency: number = 1) {
@@ -78,15 +99,44 @@ export class DownloadManager {
     this.onProgressCb = cb;
   }
 
+  private clearRetryTimers() {
+    this.retryTimers.forEach(timer => clearTimeout(timer));
+    this.retryTimers.clear();
+  }
+
   private notify() {
     if (this.onProgressCb && this.transferDetails) {
-      const downloadedBytes = this.downloadedChunks.size * this.transferDetails.chunkSize;
       const totalBytes = this.transferDetails.fileSize;
+      const totalChunks = this.transferDetails.totalChunks;
+      const chunkSize = this.transferDetails.chunkSize;
+      
+      let downloadedBytes = 0;
+      if (this.downloadedChunks.size === totalChunks) {
+        downloadedBytes = totalBytes;
+      } else {
+        for (const idx of this.downloadedChunks) {
+          if (idx === totalChunks - 1) {
+            const remainder = totalBytes % chunkSize;
+            downloadedBytes += remainder === 0 ? chunkSize : remainder;
+          } else {
+            downloadedBytes += chunkSize;
+          }
+        }
+      }
       const boundedBytes = Math.min(downloadedBytes, totalBytes);
+      
+      let progressPercent = 0;
+      if (totalBytes === 0 || this.state === 'completed' || this.downloadedChunks.size >= totalChunks) {
+        progressPercent = 100;
+      } else {
+        const calculated = Math.floor((boundedBytes / totalBytes) * 100);
+        progressPercent = Math.min(99, Math.max(0, calculated));
+      }
+
       this.onProgressCb({
         status: this.state,
-        progress: totalBytes === 0 ? 100 : Math.round((boundedBytes / totalBytes) * 100),
-        transferredBytes: boundedBytes,
+        progress: progressPercent,
+        transferredBytes: this.state === 'completed' ? totalBytes : boundedBytes,
         totalBytes,
         metadata: this.transferDetails,
         error: this.error
@@ -99,55 +149,107 @@ export class DownloadManager {
     if (transferId) this.transferId = transferId;
     if (token) this.token = token;
     
+    this.clearRetryTimers();
+    const opId = ++this.currentOperationId;
     this.state = 'starting';
     this.error = undefined;
+    this.chunkRetryCounts.clear();
     
     try {
-      this.transferDetails = await getTransferDetails(this.transferId, this.token);
+      const details = await getTransferDetails(this.transferId, this.token);
+      if (this.currentOperationId !== opId || this.state !== 'starting') return;
+      
+      this.transferDetails = details;
       this.notify();
 
       if ('showSaveFilePicker' in window) {
-        this.fileHandle = await (window as any).showSaveFilePicker({
+        const ext = this.transferDetails.fileName.includes('.')
+          ? '.' + this.transferDetails.fileName.split('.').pop()
+          : '';
+        const pickerOptions: any = {
           suggestedName: this.transferDetails.fileName
-        });
-        this.writable = await this.fileHandle!.createWritable();
+        };
+        if (this.transferDetails.contentType && this.transferDetails.contentType !== 'application/octet-stream') {
+          pickerOptions.types = [{
+            description: this.transferDetails.fileName,
+            accept: {
+              [this.transferDetails.contentType]: ext ? [ext] : []
+            }
+          }];
+        }
+        const handle = await (window as any).showSaveFilePicker(pickerOptions);
+        if (this.currentOperationId !== opId || this.state !== 'starting') return;
+        
+        this.fileHandle = handle;
+        this.writable = await this.fileHandle.createWritable();
+        if (this.currentOperationId !== opId || this.state !== 'starting') {
+          if (this.writable) {
+            await this.writable.abort().catch(() => {});
+            this.writable = null;
+          }
+          return;
+        }
       } else {
-        throw new Error('File System Access API is not supported in this browser. Please use Chrome/Edge for large file downloads.');
+        throw new Error('File System Access API is required for large file downloads in this browser. Please use Chrome or Edge.');
       }
       
       // Reconcile local state
       const local = await getLocalChunks(this.transferId);
+      if (this.currentOperationId !== opId || this.state !== 'starting') return;
       this.downloadedChunks = new Set(local);
+
+      localStorage.setItem(RECEIVER_ACTIVE_TRANSFER_KEY, this.transferId);
+      localStorage.setItem(RECEIVER_TRANSFER_PREFIX + this.transferId, JSON.stringify({
+        transferId: this.transferId,
+        token: this.token,
+        fileName: this.transferDetails.fileName,
+        fileSize: this.transferDetails.fileSize,
+        chunkSize: this.transferDetails.chunkSize,
+        totalChunks: this.transferDetails.totalChunks,
+      }));
 
       this.state = 'progressing';
       this.cancelSource = new AbortController();
       this.notify();
-      this.startPolling();
+      
+      if (this.downloadedChunks.size === this.transferDetails.totalChunks) {
+        this.processQueue();
+      } else {
+        this.startPolling();
+      }
     } catch (e) {
       if ((e as any).name === 'AbortError') {
         this.state = 'idle';
         this.notify();
         return;
       }
-      this.state = 'error';
-      this.error = e as Error;
-      this.notify();
+      if (this.currentOperationId === opId && this.state === 'starting') {
+        this.state = 'error';
+        this.error = e as Error;
+        this.notify();
+      }
     }
   }
 
   pause() {
-    if (this.state === 'progressing' || this.state === 'waiting') {
+    if (this.state === 'progressing' || this.state === 'waiting' || this.state === 'starting') {
       this.state = 'paused';
+      this.currentOperationId++;
+      this.clearRetryTimers();
       this.cancelSource?.abort();
       this.stopPolling();
+      this.inProgressChunks.clear();
       this.notify();
     }
   }
 
-  resume() {
+  async resume() {
     if (this.state === 'paused' || this.state === 'error') {
+      this.clearRetryTimers();
+      this.currentOperationId++;
       this.state = 'progressing';
       this.error = undefined;
+      this.chunkRetryCounts.clear();
       this.cancelSource = new AbortController();
       this.notify();
       this.startPolling();
@@ -177,15 +279,25 @@ export class DownloadManager {
 
   private async pollAvailability() {
     if ((this.state !== 'progressing' && this.state !== 'waiting') || !this.transferDetails) return;
+    const opId = this.currentOperationId;
+    
     try {
       const beforeCount = this.availableChunks.length;
-      this.availableChunks = await getAvailableChunks(this.transferId, this.token);
+      const chunks = await getAvailableChunks(this.transferId, this.token);
+      if (this.currentOperationId !== opId || (this.state !== 'progressing' && this.state !== 'waiting')) return;
+      
+      this.availableChunks = chunks;
       
       // Calculate backoff
       if (this.availableChunks.length > beforeCount) {
         this.currentPollInterval = 3000; // Reset backoff when new data arrives
       } else {
         this.currentPollInterval = Math.min(this.currentPollInterval * 1.5, this.MAX_POLL_INTERVAL);
+      }
+      
+      if (this.downloadedChunks.size === this.transferDetails.totalChunks) {
+        this.processQueue();
+        return;
       }
       
       if (this.availableChunks.length === this.downloadedChunks.size && this.downloadedChunks.size < this.transferDetails.totalChunks) {
@@ -201,9 +313,10 @@ export class DownloadManager {
          this.processQueue();
       }
     } catch (e) {
-      if ((e as Error).message === 'TRANSFER_EXPIRED') {
+      if (this.currentOperationId !== opId) return;
+      if (e instanceof ApiError && (e.code === 'TRANSFER_EXPIRED' || e.code === 'TRANSFER_NOT_FOUND')) {
         this.state = 'error';
-        this.error = e as Error;
+        this.error = e;
         this.stopPolling();
         this.notify();
         return;
@@ -218,16 +331,45 @@ export class DownloadManager {
     }
   }
 
+  private async writeChunkToDisk(position: number, data: Blob): Promise<void> {
+    const currentWrite = this.writeLock.catch(() => {}).then(async () => {
+      if (!this.writable) {
+        throw new Error('Writable stream is not available');
+      }
+      await this.writable.write({ type: 'write', position, data });
+    });
+    this.writeLock = currentWrite;
+    await currentWrite;
+  }
+
+  private cleanupLocalStorage() {
+    localStorage.removeItem(RECEIVER_ACTIVE_TRANSFER_KEY);
+    localStorage.removeItem(RECEIVER_TRANSFER_PREFIX + this.transferId);
+    clearLocalChunks(this.transferId);
+  }
+
   private async processQueue() {
-    if (this.state !== 'progressing' || !this.transferDetails) return;
+    if ((this.state !== 'progressing' && this.state !== 'waiting') || !this.transferDetails) return;
 
     if (this.downloadedChunks.size === this.transferDetails.totalChunks) {
-      this.state = 'completed';
+      if (this.activeDownloads > 0) return;
       this.stopPolling();
-      if (this.writable) {
-        await this.writable.close();
+      
+      try {
+        if (this.writable) {
+          await this.writeLock;
+          await this.writable.close();
+          this.writable = null;
+        }
+        this.cleanupLocalStorage();
+        this.state = 'completed';
+        this.notify();
+      } catch (err) {
+        console.error('Failed to finalize downloaded file stream', err);
+        this.state = 'error';
+        this.error = err instanceof Error ? err : new Error('Failed to finalize downloaded file on disk');
+        this.notify();
       }
-      this.notify();
       return;
     }
 
@@ -245,7 +387,7 @@ export class DownloadManager {
 
   private getNextChunkIndex(): number {
     for (const chunkIndex of this.availableChunks) {
-      if (!this.downloadedChunks.has(chunkIndex) && !this.inProgressChunks.has(chunkIndex)) {
+      if (!this.downloadedChunks.has(chunkIndex) && !this.inProgressChunks.has(chunkIndex) && !this.retryTimers.has(chunkIndex)) {
         this.inProgressChunks.add(chunkIndex);
         return chunkIndex;
       }
@@ -255,37 +397,94 @@ export class DownloadManager {
 
   private async downloadChunkWrapper(chunkIndex: number) {
     if (!this.transferDetails || !this.writable) return;
+    const opId = this.currentOperationId;
+    
     try {
       const { blob, checksum } = await downloadChunk(this.transferId, chunkIndex, this.token);
       
-      if (this.state !== 'progressing') {
+      if (this.currentOperationId !== opId || this.state !== 'progressing') {
         this.inProgressChunks.delete(chunkIndex);
         return;
       }
 
       if (checksum) {
         const calculated = await calculateSHA256(blob);
-        if (calculated !== checksum) {
+        let normalizedExpected = checksum.trim();
+        if (normalizedExpected.toLowerCase().startsWith('sha256:')) {
+          normalizedExpected = normalizedExpected.substring(7).trim();
+        } else if (normalizedExpected.toLowerCase().startsWith('sha-256:')) {
+          normalizedExpected = normalizedExpected.substring(9).trim();
+        }
+        if (calculated.toLowerCase() !== normalizedExpected.toLowerCase()) {
           throw new Error(`Checksum mismatch for chunk ${chunkIndex}`);
         }
       }
 
       const offset = chunkIndex * this.transferDetails.chunkSize;
       
-      // Write to file at offset
-      await this.writable.write({ type: 'write', position: offset, data: blob });
+      // Sequentially serialized write to disk stream at calculated offset
+      await this.writeChunkToDisk(offset, blob);
       
-      // Persist local state AFTER successful disk write
+      if (this.currentOperationId !== opId || this.state !== 'progressing') {
+        this.inProgressChunks.delete(chunkIndex);
+        return;
+      }
+      
+      // Persist local state AFTER successful disk/storage write
       await saveLocalChunk(this.transferId, chunkIndex);
       
       this.inProgressChunks.delete(chunkIndex);
+      this.chunkRetryCounts.delete(chunkIndex);
       this.downloadedChunks.add(chunkIndex);
-      this.notify();
+      if (this.downloadedChunks.size < this.transferDetails.totalChunks) {
+        this.notify();
+      }
       
     } catch (e) {
-      this.inProgressChunks.delete(chunkIndex);
-      if (this.state === 'progressing') {
-        console.error(`Chunk ${chunkIndex} failed`, e);
+      if (this.currentOperationId !== opId || this.state !== 'progressing') {
+        this.inProgressChunks.delete(chunkIndex);
+        return;
+      }
+
+      if (e instanceof ApiError) {
+        if (e.code === 'CHUNK_NOT_AVAILABLE') {
+          // Expected in progressive download if chunk not yet uploaded by sender
+          this.inProgressChunks.delete(chunkIndex);
+          if (this.state === 'progressing') {
+            this.state = 'waiting';
+            this.notify();
+          }
+          return;
+        }
+        if (e.code === 'TRANSFER_EXPIRED' || e.code === 'TRANSFER_NOT_FOUND' || e.code === 'FORBIDDEN') {
+          this.inProgressChunks.delete(chunkIndex);
+          this.cleanupLocalStorage();
+          this.state = 'error';
+          this.error = e;
+          this.stopPolling();
+          this.notify();
+          return;
+        }
+      }
+
+      // Recoverable error: retry chunk with exponential backoff
+      const retries = (this.chunkRetryCounts.get(chunkIndex) || 0) + 1;
+      this.chunkRetryCounts.set(chunkIndex, retries);
+
+      if (retries <= MAX_CHUNK_RETRIES) {
+        const backoffMs = Math.min(500 * Math.pow(2, retries - 1), 3000);
+        console.warn(`Chunk ${chunkIndex} download failed (attempt ${retries}/${MAX_CHUNK_RETRIES}), retrying in ${backoffMs}ms...`, e);
+        const timer = setTimeout(() => {
+          this.retryTimers.delete(chunkIndex);
+          this.inProgressChunks.delete(chunkIndex);
+          if (this.currentOperationId === opId && (this.state === 'progressing' || this.state === 'waiting')) {
+            this.processQueue();
+          }
+        }, backoffMs);
+        this.retryTimers.set(chunkIndex, timer);
+      } else {
+        this.inProgressChunks.delete(chunkIndex);
+        console.error(`Chunk ${chunkIndex} download failed after ${MAX_CHUNK_RETRIES} retries`, e);
         this.state = 'error';
         this.error = e as Error;
         this.stopPolling();
