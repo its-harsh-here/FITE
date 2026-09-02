@@ -8,6 +8,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.*;
 
 import java.io.InputStream;
@@ -16,23 +17,38 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 @Service
-@ConditionalOnProperty(name = "storage.type", havingValue = "r2")
-public class R2ChunkStorage implements ChunkStorage {
+@ConditionalOnProperty(name = "storage.type", havingValue = "b2")
+public class B2ChunkStorage implements ChunkStorage {
 
     private final S3Client s3Client;
     private final String bucketName;
 
-    public R2ChunkStorage(
-            @Value("${r2.bucket}") String bucketName,
-            @Value("${r2.endpoint}") String endpoint,
-            @Value("${r2.access-key}") String accessKey,
-            @Value("${r2.secret-key}") String secretKey) {
-            
+    public B2ChunkStorage(
+            @Value("${b2.bucket}") String bucketName,
+            @Value("${b2.endpoint}") String endpoint,
+            @Value("${b2.access-key}") String accessKey,
+            @Value("${b2.secret-key}") String secretKey,
+            @Value("${b2.region}") String region) {
+        this(bucketName, createS3Client(endpoint, accessKey, secretKey, region));
+    }
+
+    public B2ChunkStorage(String bucketName, S3Client s3Client) {
         this.bucketName = bucketName;
-        this.s3Client = S3Client.builder()
-                .endpointOverride(URI.create(endpoint))
+        this.s3Client = s3Client;
+    }
+
+    private static S3Client createS3Client(String endpoint, String accessKey, String secretKey, String region) {
+        String normalizedEndpoint = endpoint;
+        if (normalizedEndpoint != null && !normalizedEndpoint.startsWith("http://") && !normalizedEndpoint.startsWith("https://")) {
+            normalizedEndpoint = "https://" + normalizedEndpoint;
+        }
+        return S3Client.builder()
+                .endpointOverride(URI.create(normalizedEndpoint))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
-                .region(Region.US_EAST_1) // R2 accepts us-east-1 as the standard sigv4 region
+                .region(Region.of(region))
+                .serviceConfiguration(S3Configuration.builder()
+                        .pathStyleAccessEnabled(true)
+                        .build())
                 .build();
     }
 
@@ -54,7 +70,7 @@ public class R2ChunkStorage implements ChunkStorage {
     }
 
     private void validateTransferId(String transferId) {
-        if (transferId == null || transferId.contains("/") || transferId.contains("\\") || transferId.contains(".")) {
+        if (transferId == null || transferId.isBlank() || transferId.contains("/") || transferId.contains("\\") || transferId.contains("..")) {
             throw new StorageException("Invalid transferId");
         }
     }
@@ -69,7 +85,7 @@ public class R2ChunkStorage implements ChunkStorage {
                     .build();
             s3Client.putObject(request, RequestBody.fromInputStream(data, size));
         } catch (Exception e) {
-            throw new StorageException("Failed to upload chunk to R2", e);
+            throw new StorageException("Failed to upload chunk to Backblaze B2", e);
         }
     }
 
@@ -82,9 +98,9 @@ public class R2ChunkStorage implements ChunkStorage {
                     .build();
             return s3Client.getObject(request);
         } catch (NoSuchKeyException e) {
-            throw new StorageFileNotFoundException("Chunk not found in R2");
+            throw new StorageFileNotFoundException("Chunk not found in Backblaze B2");
         } catch (Exception e) {
-            throw new StorageException("Failed to read chunk from R2", e);
+            throw new StorageException("Failed to read chunk from Backblaze B2", e);
         }
     }
 
@@ -100,7 +116,6 @@ public class R2ChunkStorage implements ChunkStorage {
         } catch (NoSuchKeyException e) {
             return false;
         } catch (Exception e) {
-            // Treat other failures conservatively as non-existent or surface error if needed
             return false; 
         }
     }
@@ -113,8 +128,10 @@ public class R2ChunkStorage implements ChunkStorage {
                     .key(getObjectKey(transferId, chunkIndex, checksum))
                     .build();
             s3Client.deleteObject(request);
+        } catch (NoSuchKeyException e) {
+            // Idempotent deletion
         } catch (Exception e) {
-            throw new StorageException("Failed to delete chunk from R2", e);
+            throw new StorageException("Failed to delete chunk from Backblaze B2", e);
         }
     }
 
@@ -144,7 +161,7 @@ public class R2ChunkStorage implements ChunkStorage {
                     
             s3Client.deleteObjects(delReq);
         } catch (Exception e) {
-            throw new StorageException("Failed to delete transfer chunks from R2", e);
+            throw new StorageException("Failed to delete transfer chunks from Backblaze B2", e);
         }
     }
 }
