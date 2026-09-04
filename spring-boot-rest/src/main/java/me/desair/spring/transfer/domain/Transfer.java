@@ -70,7 +70,7 @@ public class Transfer {
         
         int total = (int) Math.ceil((double) fileSize / chunkSize);
         Instant now = Instant.now();
-        Instant expires = now.plus(7, ChronoUnit.DAYS);
+        Instant expires = now.plus(1, ChronoUnit.DAYS);
 
         return new Transfer(id, token, code, fileName, contentType, fileSize, chunkSize, total, TransferStatus.CREATED, now, expires);
     }
