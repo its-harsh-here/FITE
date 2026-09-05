@@ -5,6 +5,7 @@ import { ApiError } from '../api';
 const mockGetTransferDetails = vi.fn();
 const mockGetAvailableChunks = vi.fn();
 const mockDownloadChunk = vi.fn();
+const mockGetChunkDownloadUrl = vi.fn();
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -13,6 +14,7 @@ vi.mock('../api', async (importOriginal) => {
     getTransferDetails: (...args: any[]) => mockGetTransferDetails(...args),
     getAvailableChunks: (...args: any[]) => mockGetAvailableChunks(...args),
     downloadChunk: (...args: any[]) => mockDownloadChunk(...args),
+    getChunkDownloadUrl: (...args: any[]) => mockGetChunkDownloadUrl(...args),
   };
 });
 
@@ -87,6 +89,20 @@ describe('DownloadManager State Machine', () => {
       })
     };
 
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      blob: async () => new Blob(['chunk data'])
+    });
+
+    mockGetChunkDownloadUrl.mockResolvedValue({
+      chunkIndex: 0,
+      size: 50,
+      checksum: 'mock-sha256',
+      downloadUrl: 'https://s3.example.com/get-chunk',
+      expiresAt: '2099-01-01T00:00:00Z'
+    });
+
     manager = new DownloadManager('test-id', 1);
   });
 
@@ -104,13 +120,7 @@ describe('DownloadManager State Machine', () => {
       totalChunks: 2
     });
 
-    // Server says chunk 0 is available
     mockGetAvailableChunks.mockResolvedValue([0]);
-
-    mockDownloadChunk.mockResolvedValue({
-      blob: new Blob(['chunk0']),
-      checksum: 'mock-sha256'
-    });
 
     const progressLogs: string[] = [];
     manager.onProgress((p) => {
@@ -122,20 +132,23 @@ describe('DownloadManager State Machine', () => {
 
     expect(mockGetTransferDetails).toHaveBeenCalledWith('test-id', 'token123');
     expect(mockGetAvailableChunks).toHaveBeenCalledWith('test-id', 'token123');
-    expect(mockDownloadChunk).toHaveBeenCalledWith('test-id', 0, 'token123');
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledWith('test-id', 0, 'token123');
     expect(mockWritable.write).toHaveBeenCalledWith({ type: 'write', position: 0, data: expect.any(Blob) });
 
     // Server now says chunk 0 and 1 are available
     mockGetAvailableChunks.mockResolvedValue([0, 1]);
-    mockDownloadChunk.mockResolvedValue({
-      blob: new Blob(['chunk1']),
-      checksum: 'mock-sha256'
+    mockGetChunkDownloadUrl.mockResolvedValue({
+      chunkIndex: 1,
+      size: 50,
+      checksum: 'mock-sha256',
+      downloadUrl: 'https://s3.example.com/get-chunk-1',
+      expiresAt: '2099-01-01T00:00:00Z'
     });
 
     // Fast forward next poll
     await vi.advanceTimersByTimeAsync(3000);
 
-    expect(mockDownloadChunk).toHaveBeenCalledWith('test-id', 1, 'token123');
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledWith('test-id', 1, 'token123');
     expect(mockWritable.write).toHaveBeenCalledWith({ type: 'write', position: 50, data: expect.any(Blob) });
 
     // Transfer completes
@@ -155,7 +168,7 @@ describe('DownloadManager State Machine', () => {
 
     let resolveDownload: any;
     const downloadPromise = new Promise(r => resolveDownload = r);
-    mockDownloadChunk.mockReturnValue(downloadPromise);
+    (globalThis as any).fetch = vi.fn().mockReturnValue(downloadPromise);
 
     let status = '';
     manager.onProgress((p) => status = p.status);
@@ -163,17 +176,20 @@ describe('DownloadManager State Machine', () => {
     manager.start('test-id', 'token123');
     await vi.advanceTimersByTimeAsync(100);
 
-    // Chunk 0 is pending
-    expect(mockDownloadChunk).toHaveBeenCalledTimes(1);
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledTimes(1);
 
     manager.pause();
 
     // Now resolve chunk 0
-    resolveDownload({ blob: new Blob(['chunk0']), checksum: null });
+    resolveDownload({
+      ok: true,
+      status: 200,
+      blob: async () => new Blob(['chunk0'])
+    });
     await vi.advanceTimersByTimeAsync(100);
 
     // Should NOT schedule chunk 1 because we are paused
-    expect(mockDownloadChunk).toHaveBeenCalledTimes(1);
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledTimes(1);
     expect(status).toBe('paused');
   });
 
@@ -186,29 +202,33 @@ describe('DownloadManager State Machine', () => {
       totalChunks: 2
     });
 
-    // Force chunk 0 to be downloaded locally by simulating a successful run
     mockGetAvailableChunks.mockResolvedValue([0]);
-    mockDownloadChunk.mockResolvedValue({ blob: new Blob(['chunk0']), checksum: null });
 
     await manager.start('test-id', 'token123');
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(mockDownloadChunk).toHaveBeenCalledWith('test-id', 0, 'token123');
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledWith('test-id', 0, 'token123');
     manager.pause();
 
     // Create a new manager instance simulating page reload
     const manager2 = new DownloadManager('test-id', 1);
 
     mockGetAvailableChunks.mockResolvedValue([0, 1]); // Server has both
+    mockGetChunkDownloadUrl.mockResolvedValue({
+      chunkIndex: 1,
+      size: 50,
+      checksum: 'mock-sha256',
+      downloadUrl: 'https://s3.example.com/get-chunk-1',
+      expiresAt: '2099-01-01T00:00:00Z'
+    });
 
     // It should skip chunk 0 because it's in IndexedDB
     await manager2.start('test-id', 'token123');
     await vi.advanceTimersByTimeAsync(100);
 
     // Chunk 1 should be requested, not Chunk 0
-    expect(mockDownloadChunk).toHaveBeenCalledWith('test-id', 1, 'token123');
-    expect(mockDownloadChunk).not.toHaveBeenCalledWith('test-id', 0, 'token123', expect.any(Object));
-    expect(mockDownloadChunk).toHaveBeenCalledTimes(2);
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledWith('test-id', 1, 'token123');
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledTimes(2);
 
     manager2.pause();
   });
@@ -223,10 +243,12 @@ describe('DownloadManager State Machine', () => {
     });
 
     mockGetAvailableChunks.mockResolvedValue([0]);
-
-    mockDownloadChunk.mockResolvedValue({
-      blob: new Blob(['bad_data']),
-      checksum: 'wrong-checksum'
+    mockGetChunkDownloadUrl.mockResolvedValue({
+      chunkIndex: 0,
+      size: 100,
+      checksum: 'different-expected-checksum', // Mismatch with mock-sha256
+      downloadUrl: 'https://s3.example.com/get-chunk',
+      expiresAt: '2099-01-01T00:00:00Z'
     });
 
     let error: any;
@@ -246,11 +268,10 @@ describe('DownloadManager State Machine', () => {
       fileSize: 100,
       chunkSize: 50,
       totalChunks: 2,
-      status: 'UPLOADING' // Explicitly showing server is NOT complete
+      status: 'UPLOADING'
     });
 
     mockGetAvailableChunks.mockResolvedValue([0, 1]);
-    mockDownloadChunk.mockResolvedValue({ blob: new Blob(['data']), checksum: null });
 
     let status = '';
     manager.onProgress((p) => status = p.status);
@@ -283,18 +304,15 @@ describe('DownloadManager State Machine', () => {
       if (p.error) errorMsg = p.error.message;
     });
 
-    // Start with empty chunks
     mockGetAvailableChunks.mockResolvedValue([]);
     await manager.start('test-id');
 
-    // Next poll throws TRANSFER_EXPIRED
     mockGetAvailableChunks.mockRejectedValue(new ApiError(410, 'TRANSFER_EXPIRED', 'TRANSFER_EXPIRED'));
     await vi.advanceTimersByTimeAsync(3000);
 
     expect(state).toBe('error');
     expect(errorMsg).toBe('TRANSFER_EXPIRED');
 
-    // Ensure polling has stopped
     mockGetAvailableChunks.mockClear();
     await vi.advanceTimersByTimeAsync(15000);
     expect(mockGetAvailableChunks).not.toHaveBeenCalled();
@@ -312,7 +330,7 @@ describe('DownloadManager State Machine', () => {
     mockGetAvailableChunks.mockResolvedValue([0]);
 
     // Reject download with network error
-    mockDownloadChunk.mockRejectedValue(new TypeError('Failed to fetch'));
+    (globalThis as any).fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 
     let error: any;
     let status = '';
@@ -324,7 +342,7 @@ describe('DownloadManager State Machine', () => {
     await manager.start('test-id');
     await vi.runAllTimersAsync();
 
-    expect(mockWritable.write).not.toHaveBeenCalled(); // nothing written
+    expect(mockWritable.write).not.toHaveBeenCalled();
     expect(status).toBe('error');
     expect(error?.message).toContain('Failed to fetch');
   });
@@ -338,14 +356,15 @@ describe('DownloadManager State Machine', () => {
       totalChunks: 2,
     });
 
-    // Assume Chunk 0 was successfully written to IDB before a previous crash
     mockGetAvailableChunks.mockResolvedValue([0, 1]);
 
-    // Let's pretend chunk 0 is locally complete in IndexedDB.
-    // Instead of mocking IDB deeply, let's let manager run with a successful chunk0 download, 
-    // then error on chunk1.
-    mockDownloadChunk.mockResolvedValueOnce({ blob: new Blob(['chunk0']), checksum: null });
-    mockDownloadChunk.mockRejectedValue(new TypeError('Network Error'));
+    (globalThis as any).fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        blob: async () => new Blob(['chunk0'])
+      })
+      .mockRejectedValueOnce(new TypeError('Network Error'));
 
     let state = '';
     manager.onProgress((p) => state = p.status);
@@ -353,20 +372,31 @@ describe('DownloadManager State Machine', () => {
     await manager.start('test-id');
     await vi.runAllTimersAsync();
 
-    // Chunk 0 was written, chunk 1 failed
     expect(mockWritable.write).toHaveBeenCalledTimes(1);
     expect(state).toBe('error');
 
     // Fix the network for chunk 1
-    mockDownloadChunk.mockResolvedValue({ blob: new Blob(['chunk1']), checksum: null });
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      blob: async () => new Blob(['chunk1'])
+    });
+
+    mockGetChunkDownloadUrl.mockResolvedValue({
+      chunkIndex: 1,
+      size: 50,
+      checksum: 'mock-sha256',
+      downloadUrl: 'https://s3.example.com/get-chunk-1',
+      expiresAt: '2099-01-01T00:00:00Z'
+    });
 
     // Resume!
     await manager.resume();
     await vi.runAllTimersAsync();
 
-    // Only chunk 1 should be written on resume!
-    expect(mockDownloadChunk).toHaveBeenCalledWith('test-id', 1, '');
-    expect(mockWritable.write).toHaveBeenCalledTimes(2); // total writes
+    // Chunk 1 should be written on resume
+    expect(mockGetChunkDownloadUrl).toHaveBeenCalledWith('test-id', 1, '');
+    expect(mockWritable.write).toHaveBeenCalledTimes(2);
 
     expect(state).toBe('completed');
   });

@@ -34,6 +34,21 @@ export interface CreateTransferRequest {
   contentType: string;
 }
 
+export interface ChunkUploadUrlResponse {
+  uploadUrl: string;
+  storageKey: string;
+  headers?: Record<string, string>;
+  expiresAt: string;
+}
+
+export interface ChunkDownloadUrlResponse {
+  chunkIndex: number;
+  size: number;
+  checksum: string;
+  downloadUrl: string;
+  expiresAt: string;
+}
+
 export async function createTransfer(request: CreateTransferRequest): Promise<TransferMetadata> {
   const response = await fetch(apiUrl('/api/transfers'), {
     method: 'POST',
@@ -42,6 +57,57 @@ export async function createTransfer(request: CreateTransferRequest): Promise<Tr
   });
   if (!response.ok) {
     await handleResponseError(response, 'Failed to create transfer');
+  }
+  return response.json();
+}
+
+export async function getChunkUploadUrl(
+  transferId: string,
+  chunkIndex: number,
+  checksum: string,
+  size: number,
+  md5Checksum?: string
+): Promise<ChunkUploadUrlResponse> {
+  const response = await fetch(apiUrl(`/api/transfers/${transferId}/chunks/${chunkIndex}/upload-url`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ checksum, size, md5Checksum })
+  });
+  if (!response.ok) {
+    await handleResponseError(response, `Failed to get upload URL for chunk ${chunkIndex}`);
+  }
+  return response.json();
+}
+
+export async function commitChunk(
+  transferId: string,
+  chunkIndex: number,
+  checksum: string,
+  size: number,
+  md5Checksum?: string
+): Promise<void> {
+  const response = await fetch(apiUrl(`/api/transfers/${transferId}/chunks/${chunkIndex}/commit`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ checksum, size, md5Checksum })
+  });
+  if (!response.ok) {
+    await handleResponseError(response, `Failed to commit chunk ${chunkIndex}`);
+  }
+}
+
+export async function getChunkDownloadUrl(
+  transferId: string,
+  chunkIndex: number,
+  token?: string
+): Promise<ChunkDownloadUrlResponse> {
+  const cleanToken = token?.trim();
+  const url = cleanToken 
+    ? `/api/transfers/${transferId}/chunks/${chunkIndex}/download-url?token=${encodeURIComponent(cleanToken)}` 
+    : `/api/transfers/${transferId}/chunks/${chunkIndex}/download-url`;
+  const response = await fetch(apiUrl(url));
+  if (!response.ok) {
+    await handleResponseError(response, `Failed to get download URL for chunk ${chunkIndex}`);
   }
   return response.json();
 }

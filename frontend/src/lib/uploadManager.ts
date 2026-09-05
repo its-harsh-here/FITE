@@ -1,5 +1,5 @@
-import { calculateSHA256 } from './crypto';
-import { createTransfer, getAvailableChunks, uploadChunk, completeTransfer, ApiError } from '../api';
+import { calculateSHA256, calculateMD5 } from './crypto';
+import { createTransfer, getAvailableChunks, uploadChunk, getChunkUploadUrl, commitChunk, completeTransfer, ApiError } from '../api';
 import type { TransferMetadata, TransferStatus, TransferProgress } from '../types';
 
 const SENDER_ACTIVE_TRANSFER_KEY = 'sender_active_transfer_id';
@@ -247,13 +247,66 @@ export class UploadManager {
       }
 
       const checksum = await calculateSHA256(chunkBlob);
+      const md5Result = await calculateMD5(chunkBlob);
       
       if (this.currentOperationId !== opId || this.state !== 'progressing') {
         this.inProgressChunks.delete(chunkIndex);
         return;
       }
 
-      await uploadChunk(this.transferDetails.transferId, chunkIndex, chunkBlob, checksum);
+      // Try Direct-to-B2 presigned upload first; fallback to proxy uploadChunk if unsupported
+      try {
+        const urlResp = await getChunkUploadUrl(
+          this.transferDetails.transferId,
+          chunkIndex,
+          checksum,
+          chunkBlob.size,
+          md5Result.base64
+        );
+
+        if (this.currentOperationId !== opId || this.state !== 'progressing') {
+          this.inProgressChunks.delete(chunkIndex);
+          return;
+        }
+
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/octet-stream',
+          ...(urlResp.headers || {})
+        };
+        if (md5Result.base64) {
+          headers['Content-MD5'] = md5Result.base64;
+        }
+
+        const putResp = await fetch(urlResp.uploadUrl, {
+          method: 'PUT',
+          headers,
+          body: chunkBlob
+        });
+
+        if (!putResp.ok) {
+          throw new Error(`Direct B2 upload failed with status ${putResp.status}`);
+        }
+
+        if (this.currentOperationId !== opId || this.state !== 'progressing') {
+          this.inProgressChunks.delete(chunkIndex);
+          return;
+        }
+
+        await commitChunk(
+          this.transferDetails.transferId,
+          chunkIndex,
+          checksum,
+          chunkBlob.size,
+          md5Result.hex
+        );
+
+      } catch (directErr) {
+        if (directErr instanceof ApiError && (directErr.status === 400 || directErr.status === 500) && directErr.message.includes('Direct presigned upload URLs are only supported with B2 storage')) {
+          await uploadChunk(this.transferDetails.transferId, chunkIndex, chunkBlob, checksum);
+        } else {
+          throw directErr;
+        }
+      }
       
       if (this.currentOperationId !== opId || this.state !== 'progressing') {
         this.inProgressChunks.delete(chunkIndex);

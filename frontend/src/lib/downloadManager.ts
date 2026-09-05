@@ -1,4 +1,4 @@
-import { getTransferDetails, getAvailableChunks, downloadChunk, ApiError } from '../api';
+import { getTransferDetails, getAvailableChunks, downloadChunk, getChunkDownloadUrl, ApiError } from '../api';
 import { calculateSHA256 } from './crypto';
 import type { TransferMetadata, TransferStatus, TransferProgress } from '../types';
 
@@ -400,7 +400,26 @@ export class DownloadManager {
     const opId = this.currentOperationId;
     
     try {
-      const { blob, checksum } = await downloadChunk(this.transferId, chunkIndex, this.token);
+      let blob: Blob;
+      let checksum: string | null = null;
+
+      try {
+        const urlResp = await getChunkDownloadUrl(this.transferId, chunkIndex, this.token);
+        const directResp = await fetch(urlResp.downloadUrl);
+        if (!directResp.ok) {
+          throw new Error(`Direct B2 download failed with status ${directResp.status}`);
+        }
+        blob = await directResp.blob();
+        checksum = urlResp.checksum;
+      } catch (directErr) {
+        if (directErr instanceof ApiError && (directErr.status === 400 || directErr.status === 500) && directErr.message.includes('Direct presigned download URLs are only supported with B2 storage')) {
+          const res = await downloadChunk(this.transferId, chunkIndex, this.token);
+          blob = res.blob;
+          checksum = res.checksum;
+        } else {
+          throw directErr;
+        }
+      }
       
       if (this.currentOperationId !== opId || this.state !== 'progressing') {
         this.inProgressChunks.delete(chunkIndex);

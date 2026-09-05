@@ -1,5 +1,7 @@
 package me.desair.spring.transfer.application;
 
+import me.desair.spring.transfer.api.ChunkDownloadUrlResponse;
+import me.desair.spring.transfer.api.ChunkUploadUrlResponse;
 import me.desair.spring.transfer.application.exception.ChunkNotAvailableException;
 import me.desair.spring.transfer.application.exception.TransferNotFoundException;
 import me.desair.spring.transfer.domain.TransferExpiredException;
@@ -8,11 +10,13 @@ import me.desair.spring.transfer.infrastructure.persistence.TransferChunkEntity;
 import me.desair.spring.transfer.infrastructure.persistence.TransferChunkRepository;
 import me.desair.spring.transfer.infrastructure.persistence.TransferEntity;
 import me.desair.spring.transfer.infrastructure.persistence.TransferRepository;
+import me.desair.spring.transfer.infrastructure.storage.B2ChunkStorage;
 import me.desair.spring.transfer.infrastructure.storage.ChunkStorage;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import me.desair.spring.transfer.domain.Transfer;
 import me.desair.spring.transfer.domain.TransferChunk;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.List;
@@ -142,6 +146,106 @@ public class TransferService {
             throw new IllegalArgumentException("Invalid checksum format");
         }
         return normalized.toLowerCase();
+    }
+
+    public ChunkUploadUrlResponse getChunkUploadUrl(String transferId, int chunkIndex, String checksum, String md5Checksum, long size) {
+        TransferEntity entity = transferRepository.findById(transferId)
+            .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
+            
+        Transfer domain = toDomain(entity);
+        domain.checkUploadAllowed(Instant.now());
+        
+        long expectedSize = domain.getExpectedChunkSize(chunkIndex);
+        if (size != expectedSize) {
+            throw new IllegalArgumentException("Invalid chunk size. Expected " + expectedSize + " but got " + size);
+        }
+        
+        String normalizedChecksum = normalizeChecksum(checksum);
+        if (normalizedChecksum == null) {
+            throw new IllegalArgumentException("Checksum is required");
+        }
+        
+        if (!(chunkStorage instanceof B2ChunkStorage b2Storage)) {
+            throw new UnsupportedOperationException("Direct presigned upload URLs are only supported with B2 storage");
+        }
+        
+        return b2Storage.generateUploadPresignedUrl(transferId, chunkIndex, normalizedChecksum, md5Checksum, size, Duration.ofMinutes(15));
+    }
+
+    @Transactional
+    public TransferChunkEntity commitChunk(String transferId, int chunkIndex, String checksum, String md5Checksum, long size) {
+        TransferEntity entity = transferRepository.findById(transferId)
+            .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
+            
+        Transfer domain = toDomain(entity);
+        domain.checkUploadAllowed(Instant.now());
+        
+        long expectedSize = domain.getExpectedChunkSize(chunkIndex);
+        if (size != expectedSize) {
+            throw new IllegalArgumentException("Invalid chunk size. Expected " + expectedSize + " but got " + size);
+        }
+        
+        String normalizedChecksum = normalizeChecksum(checksum);
+        if (normalizedChecksum == null) {
+            throw new IllegalArgumentException("Checksum is required");
+        }
+
+        // Pre-check Idempotency if already in DB
+        Optional<TransferChunkEntity> existingChunk = chunkRepository.findByTransferIdAndChunkIndex(transferId, chunkIndex);
+        if (existingChunk.isPresent()) {
+            if (!existingChunk.get().getChecksum().equalsIgnoreCase(normalizedChecksum)) {
+                throw new IllegalStateException("Chunk already exists with different content");
+            }
+            return existingChunk.get();
+        }
+
+        if (chunkStorage instanceof B2ChunkStorage b2Storage) {
+            boolean valid = b2Storage.verifyChunkObject(transferId, chunkIndex, normalizedChecksum, md5Checksum, expectedSize);
+            if (!valid) {
+                throw new IllegalArgumentException("Chunk object validation failed in Backblaze B2");
+            }
+        }
+
+        TransferChunkEntity chunkEntity = new TransferChunkEntity();
+        chunkEntity.setTransferId(transferId);
+        chunkEntity.setChunkIndex(chunkIndex);
+        chunkEntity.setSize(size);
+        chunkEntity.setChecksum(normalizedChecksum);
+        chunkEntity.setStorageKey("transfers/" + transferId + "/chunks/" + String.format("%06d_%s", chunkIndex, normalizedChecksum));
+        chunkEntity.setUploadedAt(Instant.now());
+
+        try {
+            chunkRepository.saveAndFlush(chunkEntity);
+        } catch (org.springframework.dao.DataIntegrityViolationException ex) {
+            Optional<TransferChunkEntity> winningChunk = chunkRepository.findByTransferIdAndChunkIndex(transferId, chunkIndex);
+            if (winningChunk.isPresent() && winningChunk.get().getChecksum().equalsIgnoreCase(normalizedChecksum)) {
+                return winningChunk.get();
+            } else {
+                throw new IllegalStateException("Chunk already exists with different content");
+            }
+        }
+
+        if (entity.getStatus() == TransferStatus.CREATED) {
+            entity.setStatus(TransferStatus.UPLOADING);
+            transferRepository.save(entity);
+        }
+        
+        return chunkEntity;
+    }
+
+    public ChunkDownloadUrlResponse getChunkDownloadUrl(String transferId, int chunkIndex, String token) {
+        TransferEntity entity = transferRepository.findById(transferId)
+            .orElseThrow(() -> new TransferNotFoundException("Transfer not found"));
+        Transfer domain = toDomain(entity);
+        domain.checkAccess(token, Instant.now());
+        
+        TransferChunkEntity chunkInfo = getChunkInfo(transferId, chunkIndex, token);
+        
+        if (!(chunkStorage instanceof B2ChunkStorage b2Storage)) {
+            throw new UnsupportedOperationException("Direct presigned download URLs are only supported with B2 storage");
+        }
+        
+        return b2Storage.generateDownloadPresignedUrl(transferId, chunkIndex, chunkInfo.getChecksum(), chunkInfo.getSize(), Duration.ofMinutes(15));
     }
 
     @Transactional

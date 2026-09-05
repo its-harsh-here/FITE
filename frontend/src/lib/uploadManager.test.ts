@@ -4,6 +4,8 @@ import { UploadManager } from './uploadManager';
 const mockCreateTransfer = vi.fn();
 const mockGetAvailableChunks = vi.fn();
 const mockUploadChunk = vi.fn();
+const mockGetChunkUploadUrl = vi.fn();
+const mockCommitChunk = vi.fn();
 const mockCompleteTransfer = vi.fn();
 
 vi.mock('../api', async (importOriginal) => {
@@ -13,12 +15,15 @@ vi.mock('../api', async (importOriginal) => {
     createTransfer: (...args: any[]) => mockCreateTransfer(...args),
     getAvailableChunks: (...args: any[]) => mockGetAvailableChunks(...args),
     uploadChunk: (...args: any[]) => mockUploadChunk(...args),
+    getChunkUploadUrl: (...args: any[]) => mockGetChunkUploadUrl(...args),
+    commitChunk: (...args: any[]) => mockCommitChunk(...args),
     completeTransfer: (...args: any[]) => mockCompleteTransfer(...args),
   };
 });
 
 vi.mock('./crypto', () => ({
-  calculateSHA256: async (_blob: Blob) => 'mock-sha256'
+  calculateSHA256: async (_blob: Blob) => 'mock-sha256',
+  calculateMD5: async (_blob: Blob) => ({ hex: 'mock-md5-hex', base64: 'mock-md5-base64' })
 }));
 
 describe('UploadManager State Machine', () => {
@@ -30,8 +35,22 @@ describe('UploadManager State Machine', () => {
     vi.clearAllMocks();
 
     mockFile = new File(['chunk0', 'chunk1'], 'test.txt', { type: 'text/plain' });
-    // mock File.slice to just return portions for the sake of the test tracking
     mockFile.slice = vi.fn().mockImplementation((_start, _end) => new Blob(['mocked blob content']));
+
+    // Mock global fetch for direct-to-B2 PUT
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({})
+    });
+
+    mockGetChunkUploadUrl.mockResolvedValue({
+      uploadUrl: 'https://s3.example.com/put-chunk',
+      storageKey: 'key',
+      headers: { 'Content-MD5': 'mock-md5-base64' },
+      expiresAt: '2099-01-01T00:00:00Z'
+    });
+    mockCommitChunk.mockResolvedValue(undefined);
 
     manager = new UploadManager(1);
   });
@@ -57,12 +76,10 @@ describe('UploadManager State Machine', () => {
     // Defer the upload response so we can pause in the middle
     let resolveUpload: any;
     const uploadPromise = new Promise(r => resolveUpload = r);
-    mockUploadChunk.mockReturnValue(uploadPromise);
+    (globalThis as any).fetch = vi.fn().mockReturnValue(uploadPromise);
 
     await manager.start(mockFile);
-
-    // Chunk 0 should be requested
-    expect(mockUploadChunk).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(mockGetChunkUploadUrl).toHaveBeenCalledTimes(1));
 
     let status = '';
     manager.onProgress((p) => status = p.status);
@@ -70,11 +87,11 @@ describe('UploadManager State Machine', () => {
     manager.pause();
 
     // Now resolve chunk 0
-    resolveUpload(undefined);
+    resolveUpload({ ok: true, status: 200 });
     await vi.runAllTimersAsync();
 
     // Should NOT schedule chunk 1 because we are paused
-    expect(mockUploadChunk).toHaveBeenCalledTimes(1);
+    expect(mockGetChunkUploadUrl).toHaveBeenCalledTimes(1);
     expect(status).toBe('paused');
   });
 
@@ -92,7 +109,7 @@ describe('UploadManager State Machine', () => {
     mockGetAvailableChunks.mockResolvedValue([]);
 
     // Reject the upload with network error
-    mockUploadChunk.mockRejectedValue(new TypeError('Failed to fetch'));
+    (globalThis as any).fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 
     let error: Error | undefined;
     let status = '';
@@ -106,7 +123,7 @@ describe('UploadManager State Machine', () => {
 
     expect(status).toBe('error');
     expect(error?.message).toContain('Failed to fetch');
-    expect(mockUploadChunk).toHaveBeenCalled();
+    expect(mockGetChunkUploadUrl).toHaveBeenCalled();
   });
 
   it('reconciles after lost response (server succeeded but client failed)', async () => {
@@ -121,10 +138,7 @@ describe('UploadManager State Machine', () => {
       totalChunks: 2,
     };
 
-    // Upon start (which acts like resume here because we pass existingTransfer),
-    // the server says chunk 0 is already available (even though the client errored previously)
     mockGetAvailableChunks.mockResolvedValue([0]);
-    mockUploadChunk.mockResolvedValue(undefined); // next uploads succeed
 
     let status = '';
     manager.onProgress((p) => status = p.status);
@@ -133,15 +147,14 @@ describe('UploadManager State Machine', () => {
     await vi.runAllTimersAsync();
 
     // Chunk 0 was skipped because of reconcile
-    expect(mockUploadChunk).toHaveBeenCalledTimes(1);
-    // And it uploaded chunk 1
-    expect(mockUploadChunk).toHaveBeenCalledWith('test-id', 1, expect.any(Blob), 'mock-sha256');
+    expect(mockGetChunkUploadUrl).toHaveBeenCalledTimes(1);
+    expect(mockGetChunkUploadUrl).toHaveBeenCalledWith('test-id', 1, 'mock-sha256', expect.any(Number), 'mock-md5-base64');
+    expect(mockCommitChunk).toHaveBeenCalledWith('test-id', 1, 'mock-sha256', expect.any(Number), 'mock-md5-hex');
 
     expect(status).toBe('completed');
   });
 
   it('retries safely and skips persisted chunks automatically', async () => {
-    // If somehow a persisted chunk is sent to start(), reconcile catches it
     const existingTransfer = {
       transferId: 'test-id',
       shareToken: 'token',
@@ -162,8 +175,7 @@ describe('UploadManager State Machine', () => {
     await vi.runAllTimersAsync();
 
     // No uploads should happen
-    expect(mockUploadChunk).not.toHaveBeenCalled();
-    // And it completes
+    expect(mockGetChunkUploadUrl).not.toHaveBeenCalled();
     expect(status).toBe('completed');
   });
 });

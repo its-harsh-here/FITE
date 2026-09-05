@@ -76,11 +76,14 @@ public class RateLimitInterceptor implements HandlerInterceptor {
         } else if (path.matches("^/api/transfers/[^/]+/chunks$") && "GET".equalsIgnoreCase(method)) {
             // Polling
             bucket = getPollingBucket(ip);
-        } else if (path.matches("^/api/transfers/[^/]+/chunks/\\d+$") && "PUT".equalsIgnoreCase(method)) {
-            // Chunk upload
+        } else if ((path.matches("^/api/transfers/[^/]+/chunks/\\d+$") && "PUT".equalsIgnoreCase(method))
+                || (path.matches("^/api/transfers/[^/]+/chunks/\\d+/upload-url$") && "POST".equalsIgnoreCase(method))
+                || (path.matches("^/api/transfers/[^/]+/chunks/\\d+/commit$") && "POST".equalsIgnoreCase(method))) {
+            // Chunk upload / upload-url / commit
             bucket = getUploadBucket(ip);
-        } else if (path.matches("^/api/transfers/[^/]+/chunks/\\d+$") && "GET".equalsIgnoreCase(method)) {
-            // Chunk download
+        } else if ((path.matches("^/api/transfers/[^/]+/chunks/\\d+$") && "GET".equalsIgnoreCase(method))
+                || (path.matches("^/api/transfers/[^/]+/chunks/\\d+/download-url$") && "GET".equalsIgnoreCase(method))) {
+            // Chunk download / download-url
             bucket = getDownloadBucket(ip);
         } else {
             // Fallback for completion or other metadata endpoints

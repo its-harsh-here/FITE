@@ -543,6 +543,41 @@ This preserves the architecture defined in `STORAGE.md`.
 
 ---
 
+# 20.1 Backblaze B2 CORS Configuration (Direct Transfer)
+
+Direct browser-to-storage chunk uploads and downloads require CORS rules configured on the Backblaze B2 bucket:
+
+```json
+[
+  {
+    "corsRuleName": "AllowBrowserDirectTransfers",
+    "allowedOrigins": [
+      "https://fite-file-sharing.onrender.com",
+      "http://localhost:5173"
+    ],
+    "allowedOperations": [
+      "s3_put",
+      "s3_get",
+      "s3_head"
+    ],
+    "allowedHeaders": [
+      "content-type",
+      "content-md5",
+      "x-amz-*"
+    ],
+    "exposeHeaders": [
+      "etag",
+      "content-length"
+    ],
+    "maxAgeSeconds": 3600
+  }
+]
+```
+
+These rules ensure browser PUT uploads with `Content-MD5` header and direct GET downloads succeed without CORS preflight failures.
+
+---
+
 # 21. Domain and Provider Separation
 
 The deployment configuration must not change domain behavior.
